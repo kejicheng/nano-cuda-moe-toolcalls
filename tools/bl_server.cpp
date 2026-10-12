@@ -91,6 +91,113 @@ json error_json(const std::string & msg, const std::string & type = "invalid_req
     return json{{"error", {{"message", msg}, {"type", type}}}};
 }
 
+std::string trim(const std::string & s) {
+    const auto b = s.find_first_not_of(" \t\r\n"), e = s.find_last_not_of(" \t\r\n");
+    return b == std::string::npos ? "" : s.substr(b, e - b + 1);
+}
+
+// The system-turn preamble the model's template adds when a request carries tools. The tool objects go into
+// <tools>...</tools> verbatim (each its OpenAI object), followed by the call-format instructions the model was
+// trained on: <tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>.
+std::string tools_block(const json & tools, const json & choice) {
+    std::string s = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+    for (const auto & t : tools) s += "\n" + t.dump();
+    s += "\n</tools>";
+    s += "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+         "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+         "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
+         "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
+         "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested "
+         "within <tool_call></tool_call> XML tags\n"
+         "- Required parameters MUST be specified\n"
+         "- You may provide optional reasoning for your function call in natural language BEFORE the function call, "
+         "but NOT after\n"
+         "- If there is no function call available, answer the question like normal with your current knowledge and "
+         "do not tell the user about function calls\n</IMPORTANT>";
+    if (choice == "required") s += "\n\nYou MUST call one of the functions above.";
+    else if (choice.is_object() && choice.contains("function") && choice["function"].is_object())
+        s += "\n\nYou MUST call the function `" + choice["function"].value("name", std::string()) + "`.";
+    return s;
+}
+
+// The model's reply, split into its text and its calls. The call blocks are the template's XML form (with a JSON
+// body accepted as a fallback); each call is an OpenAI tool_call object, its arguments a JSON object string.
+// Anything the model wrote before the first call stays in content_out; the blocks themselves are removed from it.
+json parse_tool_calls(const std::string & text, std::string & content_out, long & id_seq) {
+    json calls = json::array();
+    std::string content;
+    const std::string open = "<tool_call>", close = "</tool_call>";
+    size_t pos = 0;
+    while (true) {
+        const size_t b = text.find(open, pos);
+        if (b == std::string::npos) { content += text.substr(pos); break; }
+        content += text.substr(pos, b - pos);
+        const size_t e = text.find(close, b + open.size());
+        if (e == std::string::npos) { content += text.substr(b); break; }   // unterminated: leave it as text
+        const std::string block = text.substr(b + open.size(), e - b - open.size());
+        std::string fname;
+        json args = json::object();
+        const size_t fs = block.find("<function=");
+        if (fs != std::string::npos) {
+            const size_t fe = block.find('>', fs);
+            fname = block.substr(fs + 10, fe == std::string::npos ? std::string::npos : fe - fs - 10);
+            size_t p = fe == std::string::npos ? block.size() : fe + 1;
+            while (true) {   // <parameter=KEY>\nVALUE\n</parameter>
+                const size_t ps = block.find("<parameter=", p);
+                if (ps == std::string::npos) break;
+                const size_t pe = block.find('>', ps);
+                if (pe == std::string::npos) break;
+                const std::string key = block.substr(ps + 11, pe - ps - 11);
+                size_t vs = pe + 1;
+                if (vs < block.size() && block[vs] == '\n') ++vs;
+                const size_t ve = block.find("</parameter>", vs);
+                std::string raw = block.substr(vs, ve == std::string::npos ? std::string::npos : ve - vs);
+                if (!raw.empty() && raw.back() == '\n') raw.pop_back();
+                json v;
+                try { v = json::parse(raw); } catch (...) { v = raw; }   // a number/object, else the text as is
+                args[key] = v;
+                p = ve == std::string::npos ? block.size() : ve + 12;
+            }
+        } else {   // a JSON body: {"name": "...", "arguments": {...}}
+            try {
+                const json j = json::parse(trim(block));
+                fname = j.value("name", std::string());
+                if (j.contains("arguments")) {
+                    const json & a = j["arguments"];
+                    args = a.is_string() ? json::parse(a.get<std::string>()) : a;
+                }
+            } catch (...) {}
+        }
+        if (!fname.empty())
+            calls.push_back({{"id", "call_" + std::to_string(++id_seq)}, {"type", "function"},
+                             {"function", {{"name", fname}, {"arguments", args.dump()}}}});
+        else
+            content += text.substr(b, e - b + close.size());   // not a call after all: keep it as text
+        pos = e + close.size();
+    }
+    content_out = trim(content);
+    return calls;
+}
+
+// an OpenAI tool_calls array as the template wants it in an assistant turn (for feeding a history back in)
+std::string calls_to_xml(const json & calls) {
+    std::string out;
+    for (const auto & tc : calls) {
+        const json f = tc.contains("function") ? tc["function"] : tc;
+        const std::string name = f.value("name", std::string());
+        if (name.empty()) continue;
+        json args;
+        try { const json & a = f.value("arguments", json("{}")); args = a.is_string() ? json::parse(a.get<std::string>()) : a; }
+        catch (...) { args = json::object(); }
+        out += (out.empty() ? std::string() : std::string("\n")) + "<tool_call>\n<function=" + name + ">\n";
+        for (const auto & [k, v] : args.items()) {
+            out += "<parameter=" + k + ">\n" + (v.is_string() ? v.get<std::string>() : v.dump()) + "\n</parameter>\n";
+        }
+        out += "</function>\n</tool_call>";
+    }
+    return out;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -141,6 +248,7 @@ int main(int argc, char ** argv) {
     };
     std::mutex busy;   // one generation (or a model switch) at a time
     std::atomic<long> seq{0};
+    long tool_seq = 0;   // tool_call ids (only under `busy`)
 
     httplib::Server srv;
     if (web.empty()) {   // ../web relative to this executable (build/bl-server -> web/)
@@ -216,8 +324,13 @@ int main(int argc, char ** argv) {
         std::vector<bl::Text::Message> msgs;
         bl::ChatParams cp;
         try {
-            for (const auto & m : body.at("messages"))
-                msgs.push_back({m.at("role").get<std::string>(), content_text(m.value("content", json(""))), m.value("reasoning_content", std::string())});
+            for (const auto & m : body.at("messages")) {
+                bl::Text::Message tm{m.at("role").get<std::string>(), content_text(m.value("content", json(""))),
+                                     m.value("reasoning_content", std::string()), std::string()};
+                if (m.contains("tool_calls") && m["tool_calls"].is_array())
+                    tm.tool_calls = calls_to_xml(m["tool_calls"]);   // an assistant turn's calls, back into the template
+                msgs.push_back(std::move(tm));
+            }
             cp.sampling.temperature = body.value("temperature", 0.7f);
             cp.sampling.top_p = body.value("top_p", 0.8f);
             cp.sampling.top_k = body.value("top_k", 20);
@@ -228,6 +341,11 @@ int main(int argc, char ** argv) {
             std::string effort = body.value("reasoning_effort", std::string());
             if (effort == "high") effort = "xhigh";
             cp.think = !effort.empty() ? effort : think ? "xhigh" : "";
+            if (body.contains("tools") && body["tools"].is_array() && !body["tools"].empty()) {
+                const json choice = body.value("tool_choice", json("auto"));
+                if (!(choice.is_string() && choice.get<std::string>() == "none"))   // "none" (or no tools): text only
+                    cp.tools = tools_block(body["tools"], choice);
+            }
         } catch (const std::exception & e) {
             res.status = 400;
             res.set_content(error_json(e.what()).dump(), "application/json");
@@ -246,10 +364,14 @@ int main(int argc, char ** argv) {
             try {
                 if (!cur.chat) throw std::runtime_error("no model loaded (the last switch failed)");
                 const bl::ChatResult r = cur.chat->reply(msgs, cp);
-                json msg{{"role", "assistant"}, {"content", r.content}};
+                std::string content;
+                const json calls = parse_tool_calls(r.content, content, tool_seq);
+                json msg{{"role", "assistant"}, {"content", content}};
                 if (!r.reasoning.empty()) msg["reasoning_content"] = r.reasoning;
+                if (!calls.empty()) msg["tool_calls"] = calls;
+                const std::string finish = !calls.empty() ? "tool_calls" : r.stopped_eog ? "stop" : "length";
                 res.set_content(json{{"id", id}, {"object", "chat.completion"}, {"created", created}, {"model", name},
-                                     {"choices", json::array({{{"index", 0}, {"message", msg}, {"finish_reason", r.stopped_eog ? "stop" : "length"}}})},
+                                     {"choices", json::array({{{"index", 0}, {"message", msg}, {"finish_reason", finish}}})},
                                      {"usage", usage(r)}}.dump(), "application/json");
                 std::fprintf(stderr, "%s: %d prompt (+%d reused) in %.2f s, %d tokens at %.1f tok/s\n", id.c_str(), r.n_prompt, r.n_reused,
                              r.prompt_s, r.n_generated, r.gen_s > 0 ? (r.n_generated - 1) / r.gen_s : 0.0);
@@ -270,13 +392,55 @@ int main(int argc, char ** argv) {
                 return json{{"id", id}, {"object", "chat.completion.chunk"}, {"created", created}, {"model", name},
                             {"choices", json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", finish}}})}};
             };
+            json calls = json::array();
+            std::string pend;   // content held back: it may be the beginning of a call block
+            // The model's calls come after any text, in <tool_call>...</tool_call> blocks. Send the text in front of
+            // one as soon as it is complete, turn each complete block into a tool_calls delta, and hold back a tail
+            // that could still become the marker (so it never leaks into content).
+            auto flush = [&]() -> bool {
+                while (true) {
+                    const size_t b = pend.find("<tool_call>");
+                    if (b == std::string::npos) break;
+                    const size_t e = pend.find("</tool_call>", b);
+                    if (e == std::string::npos) {   // incomplete: send the text before it, keep the rest
+                        if (b > 0 && !send(chunk(json{{"content", pend.substr(0, b)}}, nullptr))) return false;
+                        pend.erase(0, b);
+                        return true;
+                    }
+                    if (b > 0 && !send(chunk(json{{"content", pend.substr(0, b)}}, nullptr))) return false;
+                    const std::string block = pend.substr(b, e + 12 - b);
+                    pend.erase(0, e + 12);
+                    std::string discard;
+                    for (auto & c : parse_tool_calls(block, discard, tool_seq)) {
+                        c["index"] = static_cast<int>(calls.size());
+                        calls.push_back(c);
+                        if (!send(chunk(json{{"tool_calls", json::array({c})}}, nullptr))) return false;
+                    }
+                }
+                size_t hold = 0;
+                for (size_t k = std::min(pend.size(), static_cast<size_t>(11)); k > 0; --k)
+                    if (pend.compare(pend.size() - k, k, "<tool_call>", k) == 0) { hold = k; break; }
+                if (pend.size() > hold && !send(chunk(json{{"content", pend.substr(0, pend.size() - hold)}}, nullptr))) return false;
+                pend.erase(0, pend.size() - hold);
+                return true;
+            };
             send(chunk({{"role", "assistant"}, {"content", ""}}, nullptr));
             try {
                 if (!cur.chat) throw std::runtime_error("no model loaded (the last switch failed)");
                 const bl::ChatResult r = cur.chat->reply(msgs, cp, [&](const std::string & s, bool reasoning) {
-                    return send(chunk(json{{reasoning ? "reasoning_content" : "content", s}}, nullptr));   // false: the client left
+                    if (reasoning) return send(chunk(json{{"reasoning_content", s}}, nullptr));
+                    pend += s;
+                    return flush();   // false: the client left
                 });
-                json last = chunk(json::object(), r.stopped_eog ? "stop" : "length");
+                std::string tail;
+                const json rest = parse_tool_calls(pend, tail, tool_seq);
+                if (!tail.empty() && !send(chunk(json{{"content", tail}}, nullptr))) throw std::runtime_error("closed");
+                for (auto c : rest) {
+                    c["index"] = static_cast<int>(calls.size());
+                    calls.push_back(c);
+                    if (!send(chunk(json{{"tool_calls", json::array({c})}}, nullptr))) throw std::runtime_error("closed");
+                }
+                json last = chunk(json::object(), !calls.empty() ? json("tool_calls") : json(r.stopped_eog ? "stop" : "length"));
                 last["usage"] = usage(r);
                 send(last);
                 std::fprintf(stderr, "%s (stream): %d prompt (+%d reused) in %.2f s, %d tokens at %.1f tok/s\n", id.c_str(), r.n_prompt,

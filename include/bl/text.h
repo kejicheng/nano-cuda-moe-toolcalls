@@ -24,9 +24,14 @@ public:
         std::string role;        // system | developer | user | assistant | tool
         std::string content;
         std::string reasoning;   // an assistant turn's thinking (optional)
+        std::string tool_calls;  // an assistant turn's calls, already in the template's
+                                 // <tool_call><function=...><parameter=...> format (optional)
     };
     // the reasoning effort when thinking: "" = off, "low", "medium", "xhigh"
-    static std::string render(const std::vector<Message> & messages, bool add_generation_prompt, const std::string & think);
+    // tools_block: the "# Tools ... </IMPORTANT>" system preamble (built by the caller from the request's tools),
+    // empty when the request carries no tools; it is put into the system turn as the model's template does.
+    static std::string render(const std::vector<Message> & messages, bool add_generation_prompt, const std::string & think,
+                              const std::string & tools_block = "");
 
 private:
     struct Impl;

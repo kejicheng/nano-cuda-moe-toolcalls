@@ -64,8 +64,9 @@ std::string trim(const std::string & s) {
 }
 }  // namespace
 
-// the model's template (bench/prompts/chat_template.jinja) for text-only messages without tools
-std::string Text::render(const std::vector<Message> & msgs, bool add_generation_prompt, const std::string & think) {
+// the model's template (bench/prompts/chat_template.jinja); tools_block carries the tools preamble (empty: none)
+std::string Text::render(const std::vector<Message> & msgs, bool add_generation_prompt, const std::string & think,
+                         const std::string & tools_block) {
     std::string out, system;
     size_t i = 0;
     for (; i < msgs.size() && (msgs[i].role == "system" || msgs[i].role == "developer"); ++i) {
@@ -79,14 +80,21 @@ std::string Text::render(const std::vector<Message> & msgs, bool add_generation_
     else if (think == "low")
         effort = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without "
                  "unnecessary elaboration.";
-    if (!system.empty()) out += "<|im_start|>system\n" + (effort.empty() ? "" : effort + "\n\n") + system + "<|im_end|>\n";
+    if (!tools_block.empty()) {   // the tools preamble always opens a system turn (as the template does)
+        out += "<|im_start|>system\n" + (effort.empty() ? "" : effort + "\n\n") + tools_block +
+               (system.empty() ? "" : "\n\n" + system) + "<|im_end|>\n";
+    } else if (!system.empty()) out += "<|im_start|>system\n" + (effort.empty() ? "" : effort + "\n\n") + system + "<|im_end|>\n";
     else if (!effort.empty()) out += "<|im_start|>system\n" + effort + "<|im_end|>\n";
     for (; i < msgs.size(); ++i) {
         const Message & m = msgs[i];
         const std::string c = trim(m.content);
         if (m.role == "system" || m.role == "developer") throw std::runtime_error("a system message must come first");
         if (m.role == "user") out += "<|im_start|>user\n" + c + "<|im_end|>\n";
-        else if (m.role == "assistant") out += "<|im_start|>assistant\n<think>\n" + trim(m.reasoning) + "\n</think>\n\n" + c + "<|im_end|>\n";
+        else if (m.role == "assistant") {
+            out += "<|im_start|>assistant\n thinking\n" + trim(m.reasoning) + "\n</think>\n\n" + c;
+            if (!m.tool_calls.empty()) out += (c.empty() ? "" : "\n\n") + m.tool_calls;   // calls follow the content
+            out += "<|im_end|>\n";
+        }
         else if (m.role == "tool") {
             if (i == 0 || msgs[i - 1].role != "tool") out += "<|im_start|>user";
             out += "\n<tool_response>\n" + c + "\n</tool_response>";
