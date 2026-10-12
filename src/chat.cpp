@@ -39,6 +39,7 @@ ChatResult Chat::reply(const std::vector<Text::Message> & messages, const ChatPa
         if (static_cast<int>(toks.size()) + 1 > max_ctx_) throw std::runtime_error("the conversation is longer than the context");
     }
     res.n_prompt = static_cast<int>(toks.size());
+    if (p.on_prompt) p.on_prompt(res.n_prompt);
     const int room = max_ctx_ - (eng_.position() + (eng_.pending() >= 0 ? 1 : 0)) - res.n_prompt;
     const int max_new = std::max(1, std::min(p.max_new, room));
 
@@ -50,6 +51,7 @@ ChatResult Chat::reply(const std::vector<Text::Message> & messages, const ChatPa
     auto t1 = t0;
     eng_.generate(toks, max_new, p.spec, 0.5f, [&](int tok) {
         if (res.n_generated++ == 0) t1 = clock::now();
+        if (p.progress) p.progress(res.n_generated);
         generated += txt_.piece(tok);
         if (txt_.is_eog(tok)) { res.stopped_eog = true; return false; }
         if (tok == think_end_ && reasoning) {   // the reasoning is over; the answer follows (after "\n\n")

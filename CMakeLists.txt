@@ -71,8 +71,14 @@ if(BL_ENABLE_CUDA)
   target_link_libraries(bl_cuda PUBLIC CUDA::cudart CUDA::cublas bl_core ggml-cpu ggml-base)
 
   # the programs
-  add_library(bl_chat STATIC src/chat.cpp)
+  add_library(bl_chat STATIC src/chat.cpp src/telemetry.cpp)
   target_link_libraries(bl_chat PUBLIC bl_cuda bl_text)
+  # telemetry opens the driver's NVML library at runtime (dlopen) - the same thing Strata's ctypes path does, so no
+  # build-time dependency on the driver and a machine without it just reports no GPU readings
+  find_library(BL_DL_LIB dl)
+  if(BL_DL_LIB)
+    target_link_libraries(bl_chat PUBLIC ${BL_DL_LIB})
+  endif()
   add_executable(bl-chat tools/bl_chat.cpp)
   target_link_libraries(bl-chat PRIVATE bl_chat)
   add_library(bl_httplib STATIC ${BL_VENDOR}/cpp-httplib/httplib.cpp)

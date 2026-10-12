@@ -25,6 +25,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -32,6 +33,7 @@
 #include <vector>
 
 #include "bl/chat.h"
+#include "bl/telemetry.h"
 #include "httplib.h"
 #include "nlohmann/json.hpp"
 
@@ -198,6 +200,126 @@ std::string calls_to_xml(const json & calls) {
     return out;
 }
 
+// ------------------------------------------------------------------------------------------------ the Monitor
+// What GET /metrics (JSON), GET /metrics/prometheus (text) and the /monitor page show: the engine's facts, what is
+// running right now, the totals since the start, and the hardware with a minute of history for the sparklines.
+// Strate's serve/telemetry.py + GET /metrics are the model; here the sampler is C++ and the series names are the
+// same, so a dashboard written for one reads the other.
+// The live part is written from the request handler's own callbacks and read by /metrics without taking `busy`:
+// a poll must never wait for a generation.
+struct Monitor {
+    std::atomic<bool>      busy{false}, reading{false};
+    std::atomic<long long> prompt_tokens{0}, generated{0}, max_tokens{0};
+    std::atomic<double>    started{0}, first_token{0};        // steady_clock, seconds
+    std::atomic<double>    prefill_tok_s{-1}, tok_s{-1};
+    mutable std::mutex     mu;
+    std::string            id;
+
+    std::atomic<long long> requests{0}, in_tokens{0}, out_tokens{0}, reused_tokens{0};
+    std::atomic<double>    prompt_s{0}, decode_s{0}, last_tok_s{-1}, last_first_token{-1};
+    std::atomic<double>    tok_s_sum{0}, tok_s_n{0}, prefill_sum{0}, prefill_n{0};
+
+    static double clock_s() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void begin(const std::string & rid, int max_new) {
+        std::lock_guard<std::mutex> lk(mu);
+        id = rid;
+        prompt_tokens = 0;
+        generated = 0;
+        max_tokens = max_new;
+        started = clock_s();
+        first_token = 0;
+        prefill_tok_s = tok_s = -1;
+        reading = true;
+        busy = true;
+    }
+    void prompt(int n) { prompt_tokens = n; reading = true; }   // tokenized: the read begins
+    void token(int n) {
+        if (n == 1) {                                           // the first token: the read is over
+            const double t = clock_s();
+            first_token = t;
+            reading = false;
+            const long long pt = prompt_tokens.load();
+            const double dt = t - started.load();
+            if (pt > 0 && dt > 0) prefill_tok_s = static_cast<double>(pt) / dt;
+        }
+        generated = n;
+        const double t = clock_s(), f = first_token.load();
+        if (f > 0 && t > f) tok_s = static_cast<double>(n - 1) / (t - f);
+    }
+    void end(const bl::ChatResult & r) {
+        const double ts = r.gen_s > 0 ? static_cast<double>(r.n_generated - 1) / r.gen_s : -1;
+        last_tok_s = ts;
+        const double t0 = started.load(), t1 = first_token.load();
+        if (t0 > 0 && t1 > t0) last_first_token = t1 - t0;   // this request's time to its first token
+        if (ts > 0) { tok_s_sum.store(tok_s_sum.load() + ts); tok_s_n.store(tok_s_n.load() + 1); }
+        const double ps = prefill_tok_s.load();
+        if (ps > 0) { prefill_sum.store(prefill_sum.load() + ps); prefill_n.store(prefill_n.load() + 1); }
+        requests += 1;
+        in_tokens += r.n_prompt;
+        out_tokens += r.n_generated;
+        reused_tokens += r.n_reused;
+        prompt_s.store(prompt_s.load() + r.prompt_s);
+        decode_s.store(decode_s.load() + r.gen_s);
+        tok_s = prefill_tok_s = -1;
+        reading = false;
+        busy = false;
+        std::lock_guard<std::mutex> lk(mu);
+        id.clear();
+    }
+    std::string request_id() const { std::lock_guard<std::mutex> lk(mu); return id; }
+    void fail() {   // the request threw: nothing is live any more, nothing is counted
+        tok_s = prefill_tok_s = -1;
+        reading = false;
+        busy = false;
+        std::lock_guard<std::mutex> lk(mu);
+        id.clear();
+    }
+};
+
+json jnum(double v) { return std::isnan(v) ? json(nullptr) : json(std::round(v * 100) / 100); }
+json jnum_raw(double v) { return std::isnan(v) ? json(nullptr) : json(v); }
+json jint(long long v) { return v < 0 ? json(nullptr) : json(v); }
+
+json hardware_json(const bl::HardwareReading & r) {
+    return json{{"gpu_ok", r.gpu_ok}, {"gpu_name", r.gpu_name.empty() ? json(nullptr) : json(r.gpu_name)},
+                {"gpu_util", jnum(r.gpu_util)}, {"gpu_mem_used", jnum_raw(r.gpu_mem_used)},
+                {"gpu_mem_total", jnum_raw(r.gpu_mem_total)}, {"gpu_temp", jnum(r.gpu_temp)},
+                {"gpu_power", jnum(r.gpu_power)}, {"gpu_power_limit", jnum(r.gpu_power_limit)},
+                {"gpu_pcie_gen", jnum(r.gpu_pcie_gen)}, {"gpu_pcie_gen_max", jnum(r.gpu_pcie_gen_max)},
+                {"gpu_pcie_width", jnum(r.gpu_pcie_width)}, {"gpu_pcie_rx_mb", jnum(r.gpu_pcie_rx_mb)},
+                {"gpu_pcie_tx_mb", jnum(r.gpu_pcie_tx_mb)}, {"cpu", jnum(r.cpu)},
+                {"ram_used", jnum_raw(r.ram_used)}, {"ram_total", jnum_raw(r.ram_total)},
+                {"disk_read_mb", jnum(r.disk_read_mb)}, {"disk_write_mb", jnum(r.disk_write_mb)},
+                {"tok_s", jnum(r.tok_s)}, {"prefill_tok_s", jnum(r.prefill_tok_s)}};
+}
+
+json engine_json(const bl::Engine::Stats & s, const std::string & model_path, const std::string & quant, int ctx) {
+    const long long n = s.hits + s.over_pcie + s.on_cpu;
+    return json{{"model", model_path.substr(model_path.rfind('/') + 1)},
+                {"quantization", quant},
+                {"context", ctx}, {"trained_context", s.context_length},
+                {"layers", s.n_layer}, {"experts_per_layer", s.n_expert}, {"experts_per_token", s.n_expert_used},
+                {"experts_in_vram", s.experts_in_vram}, {"experts_total", s.experts_total},
+                {"expert_pinned_gb", jnum(s.expert_pinned_gb)},
+                {"vram_free_gb", jnum(s.vram_free_gb)}, {"vram_total_gb", jnum(s.vram_total_gb)},
+                {"expert_cache", s.lru ? "LRU per layer" : "periodic swaps"},
+                {"experts_in_ram", s.ram_all ? "all" : "the rest"},
+                {"expert_hits", s.hits}, {"expert_over_pcie", s.over_pcie}, {"expert_on_cpu", s.on_cpu},
+                {"expert_hit_rate_pct", n ? jnum(100.0 * static_cast<double>(s.hits) / n) : json(nullptr)},
+                {"windows", s.windows}, {"tokens", s.tokens},
+                {"lru_admissions", s.lru_admissions}, {"swaps", s.swaps},
+                {"prefetch_issued", s.prefetch_issued}, {"prefetch_used", s.prefetch_used},
+                {"expert_copies_prefill", jnum(s.experts_copied_prefill)},
+                {"mtp", s.mtp}, {"mtp_rounds", s.mtp_rounds},
+                {"drafts_offered", s.drafted}, {"drafts_accepted", s.accepted},
+                {"draft_accept_rate_pct", s.drafted ? jnum(100.0 * static_cast<double>(s.accepted) / s.drafted) : json(nullptr)},
+                {"prefill_ms_total", jnum(s.prefill_ms)},
+                {"prefill_tok_s_mean",
+                 s.prefill_ms > 0 ? jnum(1000.0 * static_cast<double>(s.tokens) / s.prefill_ms) : json(nullptr)}};
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -250,6 +372,128 @@ int main(int argc, char ** argv) {
     std::atomic<long> seq{0};
     long tool_seq = 0;   // tool_call ids (only under `busy`)
 
+    // ---- the Monitor (the struct above): the sampler, the live state the request handler fills, and the routes.
+    // Registered BEFORE the chat page's mount point: httplib serves the first matching handler, and the mount's
+    // catch-all would otherwise swallow /monitor and answer 404 (there is no file of that name).
+    Monitor mon;
+    auto tel = std::make_unique<bl::Telemetry>([&mon](bl::HardwareReading & r) {
+        const double ts = mon.tok_s.load();
+        r.tok_s = ts > 0 ? ts : bl::HardwareReading::NaN();
+        const double pf = mon.prefill_tok_s.load();
+        r.prefill_tok_s = pf > 0 ? pf : bl::HardwareReading::NaN();
+        const double n = mon.tok_s_n.load();
+        r.tok_s_mean = n > 0 ? mon.tok_s_sum.load() / n : bl::HardwareReading::NaN();
+    });
+    auto metrics_json = [&]() {
+        const bl::HardwareReading hw = tel->now();
+        const auto & st = tel->statics();
+        bl::Engine::Stats es;
+        std::string mpath;
+        {
+            std::lock_guard<std::mutex> lk(state_mu);
+            mpath = cur.path;
+            if (cur.eng) es = cur.eng->stats();
+        }
+        json histj = json::object();
+        for (const auto & [k, v] : tel->history()) {
+            json a = json::array();
+            for (double x : v) a.push_back(std::isnan(x) ? json(nullptr) : json(std::round(x * 100) / 100));
+            histj[k] = a;
+        }
+        const bool b = mon.busy.load();
+        const bool rd = mon.reading.load();
+        const double t0 = mon.started.load(), t1 = mon.first_token.load();
+        const std::string lstate = b ? (rd ? "reading" : "generating") : "idle";
+        const json live{{"state", lstate},
+                        {"id", b ? json(mon.request_id()) : json(nullptr)},
+                        {"prompt_tokens", b ? jint(mon.prompt_tokens.load()) : json(nullptr)},
+                        {"generated", b ? jint(mon.generated.load()) : json(nullptr)},
+                        {"max_tokens", b ? jint(mon.max_tokens.load()) : json(nullptr)},
+                        {"elapsed_s", b && t0 > 0 ? json(std::round((Monitor::clock_s() - t0) * 10) / 10) : json(nullptr)},
+                        {"first_token_s", b && t1 > 0 && t0 > 0 ? json(std::round((t1 - t0) * 100) / 100) : json(nullptr)},
+                        {"tok_s", lstate == "generating" && mon.generated.load() >= 2 ? jnum(mon.tok_s.load()) : json(nullptr)},
+                        {"prefill_tok_s", mon.prefill_tok_s.load() > 0 ? jnum(mon.prefill_tok_s.load()) : json(nullptr)},
+                        {"queued", 0}, {"parallel", 1}};
+        const double ps = mon.prompt_s.load(), ds = mon.decode_s.load();
+        const double tsn = mon.tok_s_n.load(), tss = mon.tok_s_sum.load();
+        const double psn = mon.prefill_n.load(), pss = mon.prefill_sum.load();
+        const double last = mon.last_tok_s.load();
+        const long long inp = mon.in_tokens.load(), out = mon.out_tokens.load();
+        const json totals{{"requests", mon.requests.load()},
+                          {"prompt_tokens", inp},
+                          {"output_tokens", out},
+                          {"reused_tokens", mon.reused_tokens.load()},
+                          {"prompt_s", jnum(ps)},
+                          {"decode_s", jnum(ds)},
+                          {"prefill_tok_s", ps > 0 ? jnum((inp - mon.reused_tokens.load()) / ps) : json(nullptr)},
+                          {"decode_tok_s", ds > 0 ? jnum(out / ds) : json(nullptr)},
+                          {"last_tok_s", last > 0 ? jnum(last) : json(nullptr)},
+                          {"last_first_token_s", mon.last_first_token.load() > 0 ? jnum(mon.last_first_token.load()) : json(nullptr)},
+                          {"tok_s_mean", tsn > 0 ? jnum(tss / tsn) : json(nullptr)},
+                          {"prefill_tok_s_mean", psn > 0 ? jnum(pss / psn) : json(nullptr)}};
+        return json{{"service", "nano-cuda-moe"},
+                    {"engine", engine_json(es, mpath.empty() ? model : mpath, current, ctx)},
+                    {"live", live},
+                    {"totals", totals},
+                    {"hardware", hardware_json(hw)},
+                    {"hardware_static",
+                     json{{"gpu_name", st.gpu_name.empty() ? json(nullptr) : json(st.gpu_name)},
+                          {"gpu_note", st.gpu_note.empty() ? json(nullptr) : json(st.gpu_note)},
+                          {"nvml", st.nvml},
+                          {"cpu_name", st.cpu_name.empty() ? json(nullptr) : json(st.cpu_name)},
+                          {"cores", st.cores}, {"threads", st.threads}}},
+                    {"history", histj},
+                    {"time", static_cast<double>(std::chrono::duration_cast<std::chrono::seconds>(
+                                                 std::chrono::system_clock::now().time_since_epoch()).count())}};
+    };
+    // the same facts in Prometheus' text format (llama.cpp's metric names, so its dashboards read this server),
+    // built from the JSON above so the two can never disagree - what Strata's serve/prometheus.py does
+    auto metrics_prom = [&]() {
+        const json m = metrics_json();
+        const json & e = m["engine"], & t = m["totals"], & hw = m["hardware"], & lv = m["live"];
+        auto n = [](const json & v) { return v.is_null() ? 0.0 : v.get<double>(); };
+        std::string out;
+        auto row = [&](const std::string & name, const char * kind, const char * help, double v) {
+            char b[96];
+            std::snprintf(b, sizeof b, "%.6g", v);
+            out += "# HELP " + name + " " + help + "\n# TYPE " + name + " " + kind + "\n" + name + " " + b + "\n";
+        };
+        const double inp = n(t["prompt_tokens"]), reused = n(t["reused_tokens"]);
+        row("llamacpp:prompt_tokens_total", "counter", "Prompt tokens read", inp - reused);
+        row("llamacpp:prompt_tokens_cached_total", "counter", "Prompt tokens the session already held", reused);
+        row("llamacpp:prompt_seconds_total", "counter", "Prompt read time", n(t["prompt_s"]));
+        row("llamacpp:tokens_predicted_total", "counter", "Tokens generated", n(t["output_tokens"]));
+        row("llamacpp:tokens_predicted_seconds_total", "counter", "Generation time", n(t["decode_s"]));
+        row("llamacpp:prompt_tokens_seconds", "gauge", "Average prompt read throughput in tokens/s", n(t["prefill_tok_s"]));
+        row("llamacpp:predicted_tokens_seconds", "gauge", "Average generation throughput in tokens/s", n(t["decode_tok_s"]));
+        row("llamacpp:requests_processing", "gauge", "Requests running", lv["state"] == "idle" ? 0.0 : 1.0);
+        row("llamacpp:requests_deferred", "gauge", "Requests waiting their turn", 0);
+        row("nano_cuda_moe:live_tokens_seconds", "gauge", "Generation throughput of the request running now", n(lv["tok_s"]));
+        row("nano_cuda_moe:live_prefill_tokens_seconds", "gauge", "Prompt read throughput of the request running now", n(lv["prefill_tok_s"]));
+        row("nano_cuda_moe:requests_total", "counter", "Requests finished", n(t["requests"]));
+        row("nano_cuda_moe:model_loaded", "gauge", "1 while the model is loaded", cur.eng ? 1 : 0);
+        row("nano_cuda_moe:context_size", "gauge", "The context the server was started with", ctx);
+        row("nano_cuda_moe:experts_in_vram", "gauge", "Routed experts currently in the VRAM cache", n(e["experts_in_vram"]));
+        row("nano_cuda_moe:experts_total", "gauge", "Routed experts in the model", n(e["experts_total"]));
+        row("nano_cuda_moe:expert_hit_rate", "gauge", "Share of expert uses served from VRAM (0-1)",
+            n(e["expert_hit_rate_pct"]) / 100.0);
+        row("nano_cuda_moe:expert_hits_total", "counter", "Expert uses served from VRAM", n(e["expert_hits"]));
+        row("nano_cuda_moe:expert_over_pcie_total", "counter", "Expert copies taken over PCIe", n(e["expert_over_pcie"]));
+        row("nano_cuda_moe:expert_on_cpu_total", "counter", "Expert uses computed on the CPU", n(e["expert_on_cpu"]));
+        row("nano_cuda_moe:drafts_offered_total", "counter", "MTP draft tokens offered", n(e["drafts_offered"]));
+        row("nano_cuda_moe:drafts_accepted_total", "counter", "MTP draft tokens accepted", n(e["drafts_accepted"]));
+        row("nano_cuda_moe:vram_used_bytes", "gauge", "VRAM the engine holds", (n(e["vram_total_gb"]) - n(e["vram_free_gb"])) * 1e9);
+        row("nano_cuda_moe:vram_total_bytes", "gauge", "VRAM of the card", n(e["vram_total_gb"]) * 1e9);
+        row("nano_cuda_moe:gpu_utilization_percent", "gauge", "GPU load", n(hw["gpu_util"]));
+        row("nano_cuda_moe:gpu_memory_used_bytes", "gauge", "VRAM the whole machine uses on the card", n(hw["gpu_mem_used"]));
+        row("nano_cuda_moe:gpu_temperature_celsius", "gauge", "GPU temperature", n(hw["gpu_temp"]));
+        row("nano_cuda_moe:gpu_power_watts", "gauge", "GPU power draw", n(hw["gpu_power"]));
+        row("nano_cuda_moe:cpu_percent", "gauge", "CPU load", n(hw["cpu"]));
+        row("nano_cuda_moe:ram_used_bytes", "gauge", "System RAM in use", n(hw["ram_used"]));
+        row("nano_cuda_moe:ram_total_bytes", "gauge", "System RAM", n(hw["ram_total"]));
+        return out;
+    };
+
     httplib::Server srv;
     if (web.empty()) {   // ../web relative to this executable (build/bl-server -> web/)
         char exe[4096];
@@ -260,7 +504,27 @@ int main(int argc, char ** argv) {
             web = d.substr(0, d.rfind('/')) + "/web";
         }
     }
-    if (web != "none" && srv.set_mount_point("/", web)) std::fprintf(stderr, "chat page: %s\n", web.c_str());
+    srv.Get("/metrics", [&](const httplib::Request & req, httplib::Response & res) {
+        // the Monitor tab polls the JSON; Prometheus asks with Accept: text/plain (or ?format=prometheus)
+        const std::string accept = req.get_header_value("Accept");
+        const bool prom = (req.has_param("format") && req.get_param_value("format") == "prometheus") ||
+                          accept.find("openmetrics") != std::string::npos || accept.find("text/plain") != std::string::npos;
+        if (prom) res.set_content(metrics_prom(), "text/plain; version=0.0.4; charset=utf-8");
+        else res.set_content(metrics_json().dump(), "application/json");
+    });
+    srv.Get("/metrics/prometheus", [&](const httplib::Request &, httplib::Response & res) {
+        res.set_content(metrics_prom(), "text/plain; version=0.0.4; charset=utf-8");
+    });
+    srv.Get("/monitor", [&](const httplib::Request &, httplib::Response & res) {
+        const std::string p = web + "/monitor.html";
+        std::ifstream f(p, std::ios::binary);
+        if (!f) { res.status = 404; res.set_content(error_json("no monitor page (" + p + ")").dump(), "application/json"); return; }
+        res.set_content(std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()), "text/html; charset=utf-8");
+    });
+    if (web != "none" && srv.set_mount_point("/", web)) {
+        std::fprintf(stderr, "chat page: %s\n", web.c_str());
+        std::fprintf(stderr, "monitor:   http://%s:%d/monitor  (JSON: /metrics, Prometheus: /metrics/prometheus)\n", host.c_str(), port);
+    }
     srv.Get("/health", [](const httplib::Request &, httplib::Response & res) { res.set_content("{\"status\":\"ok\"}", "application/json"); });
     srv.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
         res.set_content(json{{"object", "list"}, {"data", json::array({{{"id", model_name()}, {"object", "model"}, {"owned_by", "boundless"}}})}}.dump(),
@@ -353,6 +617,9 @@ int main(int argc, char ** argv) {
         }
         const bool stream = body.value("stream", false);
         const std::string id = "chatcmpl-" + std::to_string(++seq);
+        // the Monitor: this request publishes its live state from its own callbacks, so a /metrics poll sees it
+        cp.on_prompt = [&mon](int n) { mon.prompt(n); };
+        cp.progress = [&mon](int n) { mon.token(n); };
         const long created = static_cast<long>(std::time(nullptr));
         auto usage = [](const bl::ChatResult & r) {
             return json{{"prompt_tokens", r.n_prompt + r.n_reused}, {"completion_tokens", r.n_generated},
@@ -361,9 +628,11 @@ int main(int argc, char ** argv) {
         };
         if (!stream) {
             std::lock_guard<std::mutex> lk(busy);
+            mon.begin(id, cp.max_new);
             try {
                 if (!cur.chat) throw std::runtime_error("no model loaded (the last switch failed)");
                 const bl::ChatResult r = cur.chat->reply(msgs, cp);
+                mon.end(r);
                 std::string content;
                 const json calls = parse_tool_calls(r.content, content, tool_seq);
                 json msg{{"role", "assistant"}, {"content", content}};
@@ -377,6 +646,7 @@ int main(int argc, char ** argv) {
                              r.prompt_s, r.n_generated, r.gen_s > 0 ? (r.n_generated - 1) / r.gen_s : 0.0);
                 save_cache();
             } catch (const std::exception & e) {
+                mon.fail();
                 res.status = 400;
                 res.set_content(error_json(e.what()).dump(), "application/json");
             }
@@ -384,6 +654,7 @@ int main(int argc, char ** argv) {
         }
         res.set_chunked_content_provider("text/event-stream", [&, msgs, cp, id, created, name](size_t, httplib::DataSink & sink) {
             std::lock_guard<std::mutex> lk(busy);
+            mon.begin(id, cp.max_new);
             auto send = [&](const json & j) {
                 const std::string s = "data: " + j.dump() + "\n\n";
                 return sink.write(s.data(), s.size());
@@ -432,6 +703,7 @@ int main(int argc, char ** argv) {
                     pend += s;
                     return flush();   // false: the client left
                 });
+                mon.end(r);
                 std::string tail;
                 const json rest = parse_tool_calls(pend, tail, tool_seq);
                 if (!tail.empty() && !send(chunk(json{{"content", tail}}, nullptr))) throw std::runtime_error("closed");
@@ -447,6 +719,7 @@ int main(int argc, char ** argv) {
                              r.n_reused, r.prompt_s, r.n_generated, r.gen_s > 0 ? (r.n_generated - 1) / r.gen_s : 0.0);
                 save_cache();
             } catch (const std::exception & e) {
+                mon.fail();
                 send(error_json(e.what()));
             }
             const std::string done = "data: [DONE]\n\n";

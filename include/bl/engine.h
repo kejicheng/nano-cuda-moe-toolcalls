@@ -72,6 +72,24 @@ public:
     std::string report() const;
     void reset_stats();
 
+    // The engine's own facts, structured, for the Monitor (GET /metrics): the expert cache, how the misses were
+    // served, the MTP drafts, and the VRAM. The counters are read as they are - a caller reading them while a
+    // generation runs sees a slightly stale number, which is what a live dashboard wants.
+    struct Stats {
+        int       experts_in_vram = 0, experts_total = 0;
+        double    expert_pinned_gb = 0;                  // every expert that sits in pinned RAM
+        double    vram_free_gb = 0, vram_total_gb = 0;
+        long long hits = 0, over_pcie = 0, on_cpu = 0;   // how the expert misses were served
+        long long windows = 0, tokens = 0;
+        long long lru_admissions = 0, swaps = 0, prefetch_issued = 0, prefetch_used = 0;
+        long long mtp_rounds = 0, drafted = 0, accepted = 0;
+        double    prefill_ms = 0, experts_copied_prefill = 0;
+        bool      ram_all = false, lru = false, mtp = false;
+        int       n_layer = 0, n_expert = 0, n_expert_used = 0;
+        long long context_length = 0;
+    };
+    Stats stats() const;
+
     // runtime settings: cpu_share (one-token windows), cpu_share_win (longer ones), lru, lru_max, prefetch, adapt_every (0 = off), adapt_max, adapt_decay, adapt_margin
     void set(const std::string & key, double value);
 

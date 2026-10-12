@@ -2501,6 +2501,38 @@ Engine::~Engine() {
 
 const ModelConfig & Engine::config() const { return p_->c; }
 
+Engine::Stats Engine::stats() const {
+    const auto & I = *p_;
+    Stats s;
+    s.experts_in_vram = static_cast<int>(I.cached);
+    s.experts_total = static_cast<int>(I.exp_dev.size());
+    s.expert_pinned_gb = I.host_bytes / 1e9;
+    size_t fr = 0, to = 0;
+    if (cudaMemGetInfo(&fr, &to) == cudaSuccess) { s.vram_free_gb = fr / 1e9; s.vram_total_gb = to / 1e9; }
+    s.hits = I.n_hit;
+    s.over_pcie = I.n_dma;
+    s.on_cpu = I.n_cpu;
+    s.windows = I.windows;
+    s.tokens = I.steps;
+    s.lru_admissions = I.n_admit;
+    s.swaps = I.n_swaps;
+    s.prefetch_issued = I.n_pf_issued;
+    s.prefetch_used = I.n_pf_used;
+    s.mtp_rounds = I.n_rounds;
+    s.drafted = I.n_drafted;
+    s.accepted = I.n_accepted;
+    s.prefill_ms = I.t_prefill_ms;
+    s.experts_copied_prefill = static_cast<double>(I.n_pf_copied);
+    s.ram_all = I.ram_all;
+    s.lru = I.lru;
+    s.mtp = I.mtp;
+    s.n_layer = I.c.n_layer;
+    s.n_expert = I.c.n_expert;
+    s.n_expert_used = I.c.n_expert_used;
+    s.context_length = I.c.context_length;
+    return s;
+}
+
 std::string Engine::report() const {
     const auto & I = *p_;
     char buf[1024];

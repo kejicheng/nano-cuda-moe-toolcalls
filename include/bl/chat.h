@@ -18,6 +18,8 @@ struct ChatParams {
     int         max_new = 4096;
     std::string think;               // "" = no thinking; "low" / "medium" / "xhigh"
     std::string tools;               // the tools preamble for the system turn ("" = no tools in this request)
+    std::function<void(int)> progress;    // after every generated token: how many so far (the Monitor's live count)
+    std::function<void(int)> on_prompt;   // once the prompt is tokenized: its token count (the Monitor's "reading")
 };
 
 struct ChatResult {
